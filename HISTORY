@@ -38,3 +38,4 @@
 21-DEC-2017 Release 1.36 bugfixes and improvements
 06-JAN-2021 Release 1.37 bugfixes and improvements
 01-JUN-2024 Release 1.38 bugfixes, improvements, better support for bare metal
+03-SEP-2026 Lab snapshot touch (owner maintenance commit, triggers CI)
